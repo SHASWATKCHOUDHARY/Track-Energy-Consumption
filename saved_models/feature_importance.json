@@ -1,0 +1,16 @@
+{
+  "hour": 324.0,
+  "day_of_week": 147.0,
+  "month": 50.0,
+  "is_weekend": 59.0,
+  "temperature_c": 243.0,
+  "humidity_pct": 141.0,
+  "hour_sin": 296.0,
+  "hour_cos": 268.0,
+  "month_sin": 107.0,
+  "month_cos": 111.0,
+  "lag_1": 706.0,
+  "lag_24": 253.0,
+  "rolling_24_mean": 436.0,
+  "rolling_24_std": 339.0
+}

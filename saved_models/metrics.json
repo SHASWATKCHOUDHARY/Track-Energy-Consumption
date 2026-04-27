@@ -1,0 +1,42 @@
+{
+  "selected": "LightGBM",
+  "linear_regression": {
+    "model": "Linear Regression",
+    "MAE": 0.3685,
+    "RMSE": 0.5994,
+    "R2": 0.5223,
+    "MAPE": 61.54
+  },
+  "lightgbm": {
+    "model": "LightGBM",
+    "MAE": 0.3385,
+    "RMSE": 0.5686,
+    "R2": 0.5703,
+    "MAPE": 53.7
+  },
+  "xgboost": {
+    "model": "XGBoost",
+    "MAE": 0.34,
+    "RMSE": 0.5708,
+    "R2": 0.5668,
+    "MAPE": 52.81
+  },
+  "train_size": 126089,
+  "test_size": 15762,
+  "features_used": [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "temperature_c",
+    "humidity_pct",
+    "hour_sin",
+    "hour_cos",
+    "month_sin",
+    "month_cos",
+    "lag_1",
+    "lag_24",
+    "rolling_24_mean",
+    "rolling_24_std"
+  ]
+}
