@@ -66,16 +66,39 @@ SCALER_PATH     = os.path.join(MODEL_DIR, "scaler.pkl")
 METRICS_PATH    = os.path.join(MODEL_DIR, "metrics.json")
 IMPORTANCE_PATH = os.path.join(MODEL_DIR, "feature_importance.json")
 
-# Features used by the ML model
-FEATURE_COLS = [
+# Features: loaded dynamically from metrics.json (set by Colab training).
+# This fallback list is only used if metrics.json doesn't exist yet.
+_DEFAULT_FEATURE_COLS = [
     "hour", "day_of_week", "month", "is_weekend",
     "temperature_c", "humidity_pct",
-    "hour_sin", "hour_cos",      # cyclical encoding of hour
-    "month_sin", "month_cos",    # cyclical encoding of month
-    "lag_1", "lag_24",           # previous hour, same hour yesterday
-    "rolling_24_mean", "rolling_24_std" # rolling 24h stats
+    "hour_sin", "hour_cos",
+    "month_sin", "month_cos",
+    "lag_1", "lag_24",
+    "rolling_24_mean", "rolling_24_std"
 ]
 TARGET_COL = "energy_kwh"
+
+# Will be populated on first access
+_feature_cols_cache = None
+
+
+def get_feature_cols() -> list:
+    """Load the feature list the trained model expects from metrics.json."""
+    global _feature_cols_cache
+    if _feature_cols_cache is not None:
+        return _feature_cols_cache
+    if os.path.exists(METRICS_PATH):
+        with open(METRICS_PATH) as f:
+            data = json.load(f)
+        if "features_used" in data and len(data["features_used"]) > 0:
+            _feature_cols_cache = data["features_used"]
+            return _feature_cols_cache
+    _feature_cols_cache = _DEFAULT_FEATURE_COLS
+    return _feature_cols_cache
+
+
+# Keep a module-level alias for backward compatibility
+FEATURE_COLS = _DEFAULT_FEATURE_COLS
 
 # Appliance columns in the dataset
 APPLIANCE_COLS = [
@@ -224,42 +247,81 @@ def load_data(filepath: str = "dataset.csv") -> pd.DataFrame:
 
 def engineer_features(df: pd.DataFrame, history_df: pd.DataFrame = None) -> pd.DataFrame:
     """
-    Create cyclical features from hour and month, and lag/rolling features.
-    
-    If history_df is provided (during recursive prediction), it seeds the 
+    Create ALL features the trained model expects.
+
+    Generates cyclical, lag, rolling, EWM, difference, and interaction
+    features.  The exact set is driven by get_feature_cols() so it
+    automatically matches whatever the Colab-trained model used.
+
+    If history_df is provided (during recursive prediction), it seeds the
     lag and rolling calculations so features can be derived accurately.
     """
     df = df.copy()
-    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]  / 24)
-    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]  / 24)
-    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
-    
+    feature_cols = get_feature_cols()
+
+    # ── Cyclical encoding ────────────────────────────────────────────
+    if "hour" in df.columns:
+        df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]  / 24)
+        df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]  / 24)
+    if "month" in df.columns:
+        df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+        df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+    if "day_of_week" in df.columns:
+        df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"] / 7)
+        df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"] / 7)
+
+    # ── Combine with history for lag/rolling calculations ────────────
     if history_df is not None:
         combined = pd.concat([history_df, df], ignore_index=True)
     else:
         combined = df.copy()
-        
-    if TARGET_COL in combined.columns:
-        combined["lag_1"] = combined[TARGET_COL].shift(1)
-        combined["lag_24"] = combined[TARGET_COL].shift(24)
-        combined["rolling_24_mean"] = combined[TARGET_COL].shift(1).rolling(window=24).mean()
-        combined["rolling_24_std"] = combined[TARGET_COL].shift(1).rolling(window=24).std().fillna(0)
-    else:
-        combined["lag_1"] = 0
-        combined["lag_24"] = 0
-        combined["rolling_24_mean"] = 0
-        combined["rolling_24_std"] = 0
 
+    if TARGET_COL in combined.columns:
+        # Lag features
+        for lag in [1, 2, 3, 6, 12, 24, 48, 168]:
+            col_name = f"lag_{lag}"
+            if col_name in feature_cols:
+                combined[col_name] = combined[TARGET_COL].shift(lag)
+
+        # Rolling stats (on shifted data to prevent leakage)
+        shifted = combined[TARGET_COL].shift(1)
+        for w in [3, 6, 12, 24, 48, 168]:
+            mean_col = f"rolling_{w}_mean"
+            std_col  = f"rolling_{w}_std"
+            if mean_col in feature_cols:
+                combined[mean_col] = shifted.rolling(window=w).mean()
+            if std_col in feature_cols:
+                combined[std_col] = shifted.rolling(window=w).std().fillna(0)
+
+        # EWM features
+        for span in [12, 24]:
+            col_name = f"ewm_{span}"
+            if col_name in feature_cols:
+                combined[col_name] = shifted.ewm(span=span, adjust=False).mean()
+
+        # Difference features (shifted to prevent leakage)
+        if "diff_1" in feature_cols:
+            combined["diff_1"] = combined[TARGET_COL].diff(1).shift(1)
+        if "diff_24" in feature_cols:
+            combined["diff_24"] = combined[TARGET_COL].diff(24).shift(1)
+    else:
+        # No target available — fill lag/rolling with 0
+        for col in feature_cols:
+            if col not in combined.columns:
+                combined[col] = 0
+
+    # ── Extract the rows we care about ───────────────────────────────
     if history_df is not None:
         idx = len(history_df)
         df_out = combined.iloc[idx:].copy()
     else:
         df_out = combined.copy()
-        
-    # We don't dropna() here; we drop in train_model because 
-    # predict_future needs the single row back, even with zeros if NaNs arose. 
-    # (Though with 48h history, NaNs won't arise for lag_24).
+
+    # Fill any remaining missing feature columns with 0
+    for col in feature_cols:
+        if col not in df_out.columns:
+            df_out[col] = 0
+
     return df_out
 
 
@@ -279,13 +341,16 @@ def train_model(filepath: str = "dataset.csv") -> dict:
     """
     df = load_data(filepath)
     df = engineer_features(df)
-    
+
+    feature_cols = get_feature_cols()
+
     # Drop rows with NaN from shift/rolling features
-    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL])
+    existing_cols = [c for c in feature_cols if c in df.columns]
+    df = df.dropna(subset=existing_cols + [TARGET_COL])
     if len(df) < 10:
         raise ValueError(f"Insufficient data for training (only {len(df)} rows left after cleaning). At least 10 valid records required.")
 
-    X = df[FEATURE_COLS]
+    X = df[existing_cols]
     y = df[TARGET_COL]
 
     # Chronological Split (Train: 80%, Val: 10%, Test: 10%)
@@ -388,10 +453,10 @@ def train_model(filepath: str = "dataset.csv") -> dict:
     # ── Feature importances ──────────────────────────────────────────────
     feat_imp = {}
     if hasattr(best_model, "feature_importances_"):
-        for name, imp in zip(FEATURE_COLS, best_model.feature_importances_):
+        for name, imp in zip(existing_cols, best_model.feature_importances_):
             feat_imp[name] = round(float(imp), 4)
     else:
-        for name, coef in zip(FEATURE_COLS, best_model.coef_):
+        for name, coef in zip(existing_cols, best_model.coef_):
             feat_imp[name] = round(float(abs(coef)), 4)
 
     # ── Save everything ──────────────────────────────────────────────────
@@ -409,7 +474,7 @@ def train_model(filepath: str = "dataset.csv") -> dict:
         "xgboost":           xgb_m,
         "train_size":        len(X_train),
         "test_size":         len(X_test),
-        "features_used":     FEATURE_COLS,
+        "features_used":     existing_cols,
     }
     with open(METRICS_PATH, "w") as f:
         json.dump(all_metrics, f, indent=2)
@@ -431,9 +496,9 @@ def predict_future(days: int = 7, filepath: str = "dataset.csv") -> list:
     Predict hourly energy for the next `days` days.
 
     Viva:
-      Uses an autoregressive approach. Since our model relies on 
-      past energy consumption (lag features & rolling averages), 
-      we must predict hour h, feed that prediction back as the 
+      Uses an autoregressive approach. Since our model relies on
+      past energy consumption (lag features & rolling averages),
+      we must predict hour h, feed that prediction back as the
       'actual' energy for hour h, and then predict h+1.
     """
     if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
@@ -444,54 +509,85 @@ def predict_future(days: int = 7, filepath: str = "dataset.csv") -> list:
     with open(SCALER_PATH, "rb") as f:
         scaler = pickle.load(f)
 
+    feature_cols = get_feature_cols()
+
     df = load_data(filepath)
     last_date = df["datetime"].max()
-    
-    # We need the last 48 hours to seed our lag_24 and rolling_24 features
-    history_df = df.tail(48).copy().reset_index(drop=True)
-    
-    # Ensure history has TARGET_COL, though load_data guarantees it mostly
+
+    # We need the last 200 hours to seed lag_168 and rolling_168 features
+    history_size = 200
+    history_df = df.tail(history_size).copy().reset_index(drop=True)
+
+    # Compute average sensor values from history for future rows
+    sensor_cols = ['Global_reactive_power_mean', 'Voltage_mean',
+                   'Global_intensity_mean', 'Sub_metering_1_mean',
+                   'Sub_metering_2_mean', 'Sub_metering_3_mean',
+                   'energy_std', 'energy_max', 'energy_min']
+    sensor_avgs = {}
+    for col in sensor_cols:
+        if col in history_df.columns:
+            sensor_avgs[col] = float(history_df[col].mean())
+        elif col in feature_cols:
+            sensor_avgs[col] = 0.0
+
     if TARGET_COL not in history_df.columns:
         raise ValueError("History missing target column")
 
     preds = []
-    
+
     for h in range(days * 24):
         dt  = last_date + timedelta(hours=h + 1)
         doy = dt.timetuple().tm_yday
-        
-        # Synthetic future weather
-        temp = round(15 + 15 * np.sin(2 * np.pi * (doy - 80) / 365)
-                     + 3 * np.sin(2 * np.pi * (dt.hour - 6) / 24)
-                     + np.random.normal(0, 1.5), 1)
-        hum = round(np.clip(60 - 0.5 * temp + np.random.normal(0, 5), 20, 95), 1)
-        
+
+        # Build row with all possible features
         row_dict = {
             "datetime": dt, "hour": dt.hour,
             "day_of_week": dt.weekday(), "month": dt.month,
+            "day_of_year": doy,
             "is_weekend": int(dt.weekday() >= 5),
-            "temperature_c": temp, "humidity_pct": hum,
         }
-        
+
+        # Add synthetic weather if needed
+        if "temperature_c" in feature_cols:
+            temp = round(15 + 15 * np.sin(2 * np.pi * (doy - 80) / 365)
+                         + 3 * np.sin(2 * np.pi * (dt.hour - 6) / 24)
+                         + np.random.normal(0, 1.5), 1)
+            row_dict["temperature_c"] = temp
+        if "humidity_pct" in feature_cols:
+            t = row_dict.get("temperature_c", 20)
+            row_dict["humidity_pct"] = round(
+                np.clip(60 - 0.5 * t + np.random.normal(0, 5), 20, 95), 1)
+
+        # Add sensor averages for columns the model expects
+        for col, val in sensor_avgs.items():
+            row_dict[col] = val
+
+        # Interaction features
+        if "temp_x_hour" in feature_cols:
+            row_dict["temp_x_hour"] = row_dict.get("temperature_c", 20) * dt.hour
+        if "temp_x_weekend" in feature_cols:
+            row_dict["temp_x_weekend"] = row_dict.get("temperature_c", 20) * row_dict["is_weekend"]
+
         future_row_df = pd.DataFrame([row_dict])
-        
+
         # 1. Engineer features for this single row based on history
         engineered = engineer_features(future_row_df, history_df=history_df)
-        
-        # 2. Scale and Predict
-        X_test = scaler.transform(engineered[FEATURE_COLS])
-        pred_val = float(model.predict(X_test)[0])
-        
-        # Avoid negative predictions
+
+        # 2. Ensure all required features exist
+        for col in feature_cols:
+            if col not in engineered.columns:
+                engineered[col] = 0
+
+        # 3. Scale and Predict
+        X_pred = scaler.transform(engineered[feature_cols])
+        pred_val = float(model.predict(X_pred)[0])
         pred_val = max(0.0, pred_val)
-        
-        # 3. Add prediction back to history and to our results
+
+        # 4. Add prediction back to history
         row_dict[TARGET_COL] = pred_val
         new_row_df = pd.DataFrame([row_dict])
-        
-        # Update history_df, keeping only the last 48 rows to save memory
-        history_df = pd.concat([history_df, new_row_df], ignore_index=True).tail(48)
-        
+        history_df = pd.concat([history_df, new_row_df], ignore_index=True).tail(history_size)
+
         preds.append({
             "datetime": dt.strftime("%Y-%m-%d %H:%M"),
             "predicted_kwh": round(pred_val, 3)
@@ -731,11 +827,20 @@ def get_feature_importance() -> list | None:
         nice_names = {
             "hour": "Hour", "day_of_week": "Day of Week",
             "month": "Month", "is_weekend": "Weekend?",
+            "day_of_year": "Day of Year",
             "temperature_c": "Temperature", "humidity_pct": "Humidity",
             "hour_sin": "Hour (sin)", "hour_cos": "Hour (cos)",
             "month_sin": "Month (sin)", "month_cos": "Month (cos)",
+            "dow_sin": "Day (sin)", "dow_cos": "Day (cos)",
+            "energy_std": "Energy Std Dev", "energy_max": "Energy Max",
+            "energy_min": "Energy Min",
+            "Global_reactive_power_mean": "Reactive Power",
+            "Voltage_mean": "Voltage", "Global_intensity_mean": "Current",
+            "Sub_metering_1_mean": "Kitchen", "Sub_metering_2_mean": "Laundry",
+            "Sub_metering_3_mean": "Water Heater",
+            "temp_x_hour": "Temp × Hour", "temp_x_weekend": "Temp × Weekend",
         }
-        return [{"name": nice_names.get(k, k), "importance": v}
+        return [{"name": nice_names.get(k, k.replace('_', ' ').title()), "importance": v}
                 for k, v in sorted(data.items(), key=lambda x: -x[1])]
     return None
 
