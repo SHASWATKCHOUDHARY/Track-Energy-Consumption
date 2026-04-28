@@ -1,0 +1,5 @@
+[build]
+builder = "NIXPACKS"
+
+[phases.setup]
+aptPkgs = ["libgomp1"]
