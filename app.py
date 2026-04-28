@@ -37,8 +37,8 @@
 import os
 from flask import Flask, render_template, request, jsonify, send_file
 
-import model as ml
-from generate_dataset import generate_dataset
+from training import model as ml
+from training.generate_dataset import generate_dataset
 
 # ── Flask Setup ──────────────────────────────────────────────────────────
 app = Flask(__name__)
