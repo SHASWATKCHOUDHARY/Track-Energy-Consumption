@@ -216,13 +216,28 @@ def upload_dataset():
     if filename.endswith(".csv") or filename.endswith(".txt"):
         try:
             content = file.read().decode('utf-8')
-            df = pd.read_csv(io.StringIO(content), sep=',')
-            if len(df.columns) <= 1:
-                df = pd.read_csv(io.StringIO(content), sep=';')
-            if len(df.columns) <= 1:
-                df = pd.read_csv(io.StringIO(content), sep='\t')
-            if len(df.columns) <= 1:
-                df = pd.read_csv(io.StringIO(content), sep=r'\s+')
+            separators = [',', ';', '\t', r'\s+']
+            df = None
+            last_error = None
+            
+            for s in separators:
+                try:
+                    # Try reading with current separator
+                    test_df = pd.read_csv(io.StringIO(content), sep=s, engine='python', on_bad_lines='skip')
+                    # If we found multiple columns, it's likely the right separator
+                    if len(test_df.columns) > 1:
+                        df = test_df
+                        break
+                    # Keep track of the first one we tried as fallback
+                    if df is None:
+                        df = test_df
+                except Exception as inner_e:
+                    last_error = str(inner_e)
+                    continue
+            
+            if df is None:
+                raise Exception(last_error or "Could not parse CSV/TXT file.")
+                
             return _process_and_save_df(df)
         except Exception as e:
             return jsonify({"status": "error", "message": f"Failed to parse file: {str(e)}"}), 400
