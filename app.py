@@ -44,12 +44,19 @@ from training.generate_dataset import generate_dataset
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB upload limit
 
-DATASET_PATH = "dataset.csv"
+# Cloud compatibility: use /tmp for writable files on Vercel/Railway
+IS_CLOUD = any(os.environ.get(x) for x in ["VERCEL", "RAILWAY_STATIC_URL", "RENDER"])
+DATASET_PATH = "/tmp/dataset.csv" if IS_CLOUD else "dataset.csv"
 
-# Auto-generate dataset on first run
+# Auto-generate dataset on first run if it doesn't exist
 if not os.path.exists(DATASET_PATH):
-    print("📊  No dataset found — generating synthetic data …")
-    generate_dataset(DATASET_PATH)
+    # On cloud platforms, if /tmp/dataset.csv doesn't exist, check if we have one in root to copy
+    if IS_CLOUD and os.path.exists("dataset.csv"):
+        import shutil
+        shutil.copy("dataset.csv", DATASET_PATH)
+    else:
+        print("📊  No dataset found — generating synthetic data …")
+        generate_dataset(DATASET_PATH)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

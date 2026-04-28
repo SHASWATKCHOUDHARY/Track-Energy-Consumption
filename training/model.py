@@ -60,11 +60,24 @@ import xgboost as xgb
 import lightgbm as lgb
 
 # ── File Paths ───────────────────────────────────────────────────────────
-MODEL_DIR       = "saved_models"
-MODEL_PATH      = os.path.join(MODEL_DIR, "energy_model.pkl")
-SCALER_PATH     = os.path.join(MODEL_DIR, "scaler.pkl")
-METRICS_PATH    = os.path.join(MODEL_DIR, "metrics.json")
-IMPORTANCE_PATH = os.path.join(MODEL_DIR, "feature_importance.json")
+IS_CLOUD = any(os.environ.get(x) for x in ["VERCEL", "RAILWAY_STATIC_URL", "RENDER"])
+BASE_MODEL_DIR = "saved_models"
+WRITABLE_MODEL_DIR = "/tmp/saved_models" if IS_CLOUD else "saved_models"
+
+def get_path(filename, for_write=False):
+    """
+    Get the path for a model file.
+    If for_write=True, always returns the writable directory path.
+    Otherwise, returns the writable path if it exists, falling back to base.
+    """
+    writable_path = os.path.join(WRITABLE_MODEL_DIR, filename)
+    if for_write:
+        return writable_path
+    if os.path.exists(writable_path):
+        return writable_path
+    return os.path.join(BASE_MODEL_DIR, filename)
+
+MODEL_DIR = WRITABLE_MODEL_DIR
 
 # Features: loaded dynamically from metrics.json (set by Colab training).
 # This fallback list is only used if metrics.json doesn't exist yet.
@@ -87,8 +100,9 @@ def get_feature_cols() -> list:
     global _feature_cols_cache
     if _feature_cols_cache is not None:
         return _feature_cols_cache
-    if os.path.exists(METRICS_PATH):
-        with open(METRICS_PATH) as f:
+    metrics_path = get_path("metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path) as f:
             data = json.load(f)
         if "features_used" in data and len(data["features_used"]) > 0:
             _feature_cols_cache = data["features_used"]
@@ -460,11 +474,11 @@ def train_model(filepath: str = "dataset.csv") -> dict:
             feat_imp[name] = round(float(abs(coef)), 4)
 
     # ── Save everything ──────────────────────────────────────────────────
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(WRITABLE_MODEL_DIR, exist_ok=True)
 
-    with open(MODEL_PATH, "wb") as f:
+    with open(get_path("energy_model.pkl", for_write=True), "wb") as f:
         pickle.dump(best_model, f)
-    with open(SCALER_PATH, "wb") as f:
+    with open(get_path("scaler.pkl", for_write=True), "wb") as f:
         pickle.dump(scaler, f)
 
     all_metrics = {
@@ -476,9 +490,9 @@ def train_model(filepath: str = "dataset.csv") -> dict:
         "test_size":         len(X_test),
         "features_used":     existing_cols,
     }
-    with open(METRICS_PATH, "w") as f:
+    with open(get_path("metrics.json", for_write=True), "w") as f:
         json.dump(all_metrics, f, indent=2)
-    with open(IMPORTANCE_PATH, "w") as f:
+    with open(get_path("feature_importance.json", for_write=True), "w") as f:
         json.dump(feat_imp, f, indent=2)
 
     print(f"✅  Model trained — best: {best_m['model']}  "
@@ -501,12 +515,14 @@ def predict_future(days: int = 7, filepath: str = "dataset.csv") -> list:
       we must predict hour h, feed that prediction back as the
       'actual' energy for hour h, and then predict h+1.
     """
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
+    model_path = get_path("energy_model.pkl")
+    scaler_path = get_path("scaler.pkl")
+    if not os.path.exists(model_path) or not os.path.exists(scaler_path):
         raise ValueError("Model not trained.")
 
-    with open(MODEL_PATH, "rb") as f:
+    with open(model_path, "rb") as f:
         model = pickle.load(f)
-    with open(SCALER_PATH, "rb") as f:
+    with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
     feature_cols = get_feature_cols()
@@ -821,8 +837,9 @@ def get_appliance_breakdown(filepath: str = "dataset.csv") -> dict:
 
 def get_feature_importance() -> list | None:
     """Load saved feature importances for the bar chart."""
-    if os.path.exists(IMPORTANCE_PATH):
-        with open(IMPORTANCE_PATH) as f:
+    imp_path = get_path("feature_importance.json")
+    if os.path.exists(imp_path):
+        with open(imp_path) as f:
             data = json.load(f)
         nice_names = {
             "hour": "Hour", "day_of_week": "Day of Week",
@@ -957,13 +974,14 @@ def get_recommendations(filepath: str = "dataset.csv") -> list:
 
 def is_model_trained() -> bool:
     """Check whether a trained model exists on disk."""
-    return os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH)
+    return os.path.exists(get_path("energy_model.pkl")) and os.path.exists(get_path("scaler.pkl"))
 
 
 def get_model_metrics() -> dict | None:
     """Load saved evaluation metrics."""
-    if os.path.exists(METRICS_PATH):
-        with open(METRICS_PATH) as f:
+    metrics_path = get_path("metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path) as f:
             return json.load(f)
     return None
 
@@ -990,7 +1008,8 @@ def get_model_metrics() -> dict | None:
 #  to Holt-Winters (statsmodels) — both are legitimate advanced methods.
 # ═══════════════════════════════════════════════════════════════════════════
 
-FORECAST_PATH = os.path.join(MODEL_DIR, "forecast_result.json")
+def get_forecast_path(for_write=False):
+    return get_path("forecast_result.json", for_write=for_write)
 
 
 def _daily_series(filepath: str = "dataset.csv") -> pd.Series:
@@ -1114,7 +1133,7 @@ def train_forecast_model(filepath: str = "dataset.csv",
     ]
 
     result = {"method": method, "metrics": metrics, "forecast": forecast}
-    with open(FORECAST_PATH, "w") as f:
+    with open(get_forecast_path(for_write=True), "w") as f:
         json.dump(result, f, indent=2)
 
     print(f"✅  Forecast trained — method: {method}  (RMSE={metrics['RMSE']})")
@@ -1123,8 +1142,9 @@ def train_forecast_model(filepath: str = "dataset.csv",
 
 def get_forecast_result() -> dict | None:
     """Load saved forecast result from disk."""
-    if os.path.exists(FORECAST_PATH):
-        with open(FORECAST_PATH) as f:
+    forecast_path = get_forecast_path()
+    if os.path.exists(forecast_path):
+        with open(forecast_path) as f:
             return json.load(f)
     return None
 
